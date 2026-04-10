@@ -50,7 +50,7 @@ DIVERGENCE_THRESHOLD = 0.06
 DIVERGENCE_MAX       = 0.12
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
-ENTRY_OPEN_SECS      = 65
+ENTRY_OPEN_SECS      = 40
 ENTRY_CLOSE_SECS     = 30
 RESOLUTION_MAX_SECS  = 7   # solo chequear resolucion cuando queden <= 7s
 
