@@ -47,7 +47,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
 DIVERGENCE_THRESHOLD = 0.06
-DIVERGENCE_MAX       = 0.12
+DIVERGENCE_MAX       = 0.115
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
 ENTRY_OPEN_SECS      = 40
