@@ -45,9 +45,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 #  PARÁMETROS
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
-DIVERGENCE_THRESHOLD = 0.06
-DIVERGENCE_MAX       = 0.115   # ← CAMBIADO: era 0.12 — elimina gaps >11.5pts (WR 77%)
-HARM_ENTRY_MIN       = 0.90    # ← NUEVO: media armónica mínima — WR 99.3% en backtest
+DIVERGENCE_THRESHOLD = 0.07
+DIVERGENCE_MAX       = 0.09   
+HARM_ENTRY_MIN       = 0.90    
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
 ENTRY_OPEN_SECS      = 40
