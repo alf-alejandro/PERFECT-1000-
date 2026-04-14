@@ -11,6 +11,12 @@ v7: Filtros optimizados con datos reales.
   - DIVERGENCE_MAX  = 0.115  (era 0.12)  — elimina gaps >11.5pts que tienen WR 77%
   - HARM_ENTRY_MIN  = 0.90   (nuevo)     — solo entra cuando media armónica >= 0.90
     → Backtest: WR 99.3%, PF 12.39, 1 solo loss en 142 trades
+
+v8: Filtro de primera señal por ciclo.
+  - Solo entra si la PRIMERA señal del ciclo tiene gap_pts estrictamente entre
+    FIRST_SIGNAL_GAP_MIN y FIRST_SIGNAL_GAP_MAX (-9 a -7 pts).
+  - Si la primera señal no cumple el rango, el ciclo se bloquea (no se
+    vuelve a intentar hasta discover_all() del siguiente ciclo).
 """
 
 import asyncio
@@ -46,8 +52,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ═══════════════════════════════════════════════════════
 POLL_INTERVAL        = 0.5
 DIVERGENCE_THRESHOLD = 0.06
-DIVERGENCE_MAX       = 0.115   # ← CAMBIADO: era 0.12 — elimina gaps >11.5pts (WR 77%)
-HARM_ENTRY_MIN       = 0.90    # ← NUEVO: media armónica mínima — WR 99.3% en backtest
+DIVERGENCE_MAX       = 0.115   # elimina gaps >11.5pts (WR 77%)
+HARM_ENTRY_MIN       = 0.90    # media armónica mínima — WR 99.3% en backtest
+
+# Filtro de rango exclusivo para la PRIMERA señal del ciclo.
+# Solo entra si div_abs está estrictamente dentro de este rango.
+# Equivale a gap_pts estrictamente entre -9 y -7 (signos negativos → div negativa).
+FIRST_SIGNAL_GAP_MIN = 0.07    # |gap| > 7pts  (excluye -7 exacto)
+FIRST_SIGNAL_GAP_MAX = 0.09    # |gap| < 9pts  (excluye -9 exacto)
+
 WAKE_UP_SECS         = 90
 ENTRY_WINDOW_SECS    = 85
 ENTRY_OPEN_SECS      = 40
@@ -101,6 +114,9 @@ bt = {
     "positions":    [],          # ← LISTA de posiciones (máx 3)
     "pending_positions": [],     # ← posiciones esperando resolución de Gamma
     "traded_this_cycle": False,
+    # Flag: True una vez que la primera señal del ciclo fue evaluada.
+    # Impide entrar en señales posteriores si la primera no cumplió el rango.
+    "first_signal_evaluated": False,
     "capital":      CAPITAL_TOTAL,
     "total_pnl":    0.0,
     "peak_capital": CAPITAL_TOTAL,
@@ -214,11 +230,6 @@ def _move_to_pending(pos: dict):
 
 
 def _get_last_trade_price(token_id: str) -> float | None:
-    """
-    Consulta el último precio de trade del CLOB para un token.
-    Cuando un mercado resuelve, el último trade del token ganador es 1.0 (o muy cercano).
-    Endpoint: GET /last-trade-price?token_id=...
-    """
     try:
         r = requests.get(
             f"{CLOB_HOST}/last-trade-price",
@@ -236,14 +247,6 @@ def _get_last_trade_price(token_id: str) -> float | None:
 
 
 async def _check_clob_resolution(pos: dict) -> str | None:
-    """
-    Detecta resolución directamente vía CLOB sin depender de Gamma.
-    Gamma tiene lag de varios minutos — el CLOB refleja el estado on-chain inmediatamente.
-
-    Estrategia en 2 pasos:
-      1. last-trade-price: cuando un token gana, su último trade es >= 0.98
-      2. order book: bid >= 0.98 sin asks = token resuelto en 1.0
-    """
     snap     = pos.get("market_info_snapshot") or {}
     side     = pos["side"]
     up_tid   = snap.get("up_token_id")
@@ -289,12 +292,6 @@ async def _check_clob_resolution(pos: dict) -> str | None:
 
 
 async def pending_resolution_loop():
-    """
-    Loop independiente que corre en paralelo al main_loop.
-
-    Usa CLOB directo (last-trade-price + order book) como unica fuente.
-    Si el CLOB no detecta resolucion en el primer poll -> LOSS conservador.
-    """
     while True:
         await asyncio.sleep(GAMMA_POLL_INTERVAL)
         if not bt["pending_positions"]:
@@ -359,6 +356,7 @@ def write_state():
         "signal_div": round(bt["signal_div"], 4),
         "positions": bt["positions"],
         "pending_resolution": None,
+        "first_signal_evaluated": bt["first_signal_evaluated"],
         "markets": {
             sym: {
                 "up_mid": round(markets[sym]["up_mid"], 4),
@@ -437,7 +435,8 @@ async def discover_all():
             markets[sym]["info"]  = None
             markets[sym]["error"] = str(e)
             log_event(f"{sym}: error en discovery — {e}")
-    bt["traded_this_cycle"] = False
+    bt["traded_this_cycle"]     = False
+    bt["first_signal_evaluated"] = False   # ← reset en cada nuevo ciclo
     write_state()
 
 
@@ -555,10 +554,6 @@ def compute_signals():
 def _build_single_position(sym: str, side: str, secs: float,
                             harm_entry: float, gap_entry: float,
                             capital_before: float) -> dict | None:
-    """
-    Construye una posición individual para un símbolo.
-    Retorna None si el activo no cumple los filtros de precio.
-    """
     if side == "UP":
         entry_ask = markets[sym]["up_ask"]
         entry_bid = markets[sym]["up_bid"]
@@ -612,13 +607,18 @@ def _build_single_position(sym: str, side: str, secs: float,
 
 def check_entry():
     """
-    Abre posición en los 3 activos simultáneamente cuando se detecta
-    el armónico con consenso FULL y divergencia dentro del rango válido.
+    Abre posición en los 3 activos cuando se detecta señal con consenso FULL.
+
+    Filtro de primera señal (v8):
+      Antes de cualquier otro filtro, si es la primera señal del ciclo
+      (first_signal_evaluated == False), verifica que div_abs esté
+      estrictamente dentro de [FIRST_SIGNAL_GAP_MIN, FIRST_SIGNAL_GAP_MAX].
+      Si no cumple → marca el ciclo como bloqueado y no vuelve a intentar
+      hasta el próximo discover_all().
 
     Filtros v7:
       - DIVERGENCE_MAX  = 0.115  → gaps >11.5pts tienen WR 77%, se descartan
-      - HARM_ENTRY_MIN  = 0.90   → media armónica mínima para entrar
-        (backtest: WR 99.3%, PF 12.39, 1 loss en 142 trades)
+      - HARM_ENTRY_MIN  = 0.90   → media armónica mínima
     """
     if bt["traded_this_cycle"]:
         return
@@ -631,6 +631,28 @@ def check_entry():
         return
 
     div_abs = abs(bt["signal_div"])
+
+    # ── FILTRO PRIMERA SEÑAL DEL CICLO (v8) ──────────────────────────────────
+    if not bt["first_signal_evaluated"]:
+        bt["first_signal_evaluated"] = True   # marca: ya evaluamos la primera señal
+
+        in_range = FIRST_SIGNAL_GAP_MIN < div_abs < FIRST_SIGNAL_GAP_MAX
+        if not in_range:
+            log_event(
+                f"PRIMERA SEÑAL FUERA DE RANGO — gap={div_abs*100:.2f}pts "
+                f"(rango válido: {FIRST_SIGNAL_GAP_MIN*100:.0f}–{FIRST_SIGNAL_GAP_MAX*100:.0f}pts) "
+                f"— ciclo bloqueado hasta el próximo mercado"
+            )
+            bt["skipped"]           += 1
+            bt["traded_this_cycle"]  = True   # bloquea el resto del ciclo
+            return
+        else:
+            log_event(
+                f"PRIMERA SEÑAL EN RANGO — gap={div_abs*100:.2f}pts "
+                f"(rango válido: {FIRST_SIGNAL_GAP_MIN*100:.0f}–{FIRST_SIGNAL_GAP_MAX*100:.0f}pts) — procediendo"
+            )
+    # ─────────────────────────────────────────────────────────────────────────
+
     if div_abs < DIVERGENCE_THRESHOLD:
         return
     if div_abs > DIVERGENCE_MAX:
@@ -640,7 +662,6 @@ def check_entry():
         bt["skipped"] += 1
         return
 
-    # ── FILTRO NUEVO: media armónica mínima ──────────────────────────────────
     side       = bt["signal_side"]
     harm_entry = bt["harm_up"] if side == "UP" else bt["harm_dn"]
 
@@ -651,7 +672,6 @@ def check_entry():
         )
         bt["skipped"] += 1
         return
-    # ─────────────────────────────────────────────────────────────────────────
 
     gap_entry  = bt["signal_div"]
     secs       = min_secs_remaining() or 0
@@ -701,14 +721,10 @@ def _apply_resolution(pos, resolved, source="CLOB"):
     _record_trade(pos, resolved, outcome, pnl, source=source)
 
 
-RESOLUTION_CONFIRM_SAMPLES = 5   # 5 muestras x 0.5s = 2.5s sostenidos
+RESOLUTION_CONFIRM_SAMPLES = 5
 
 
 def _is_confirmed_resolved(sym):
-    """Retorna 'UP', 'DOWN' o None.
-    Solo resuelve si TODAS las ultimas RESOLUTION_CONFIRM_SAMPLES muestras
-    del mid_history superan los umbrales.
-    """
     history = list(mid_history[sym])
     if len(history) < RESOLUTION_CONFIRM_SAMPLES:
         return None
@@ -839,18 +855,20 @@ def _save_log():
     with open(LOG_FILE, "w") as f:
         json.dump({
             "summary": {
-                "capital_inicial": CAPITAL_TOTAL,
-                "capital_actual":  round(bt["capital"], 4),
-                "total_pnl_usd":   round(bt["total_pnl"], 4),
-                "roi_pct":         round((bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100, 2),
-                "max_drawdown":    round(bt["max_drawdown"], 4),
-                "wins":            bt["wins"],
-                "losses":          bt["losses"],
-                "win_rate":        round(bt["wins"] / total * 100, 1) if total else 0,
-                "skipped":         bt["skipped"],
-                "entry_usd":       ENTRY_USD,
-                "divergence_max":  DIVERGENCE_MAX,
-                "harm_entry_min":  HARM_ENTRY_MIN,
+                "capital_inicial":       CAPITAL_TOTAL,
+                "capital_actual":        round(bt["capital"], 4),
+                "total_pnl_usd":         round(bt["total_pnl"], 4),
+                "roi_pct":               round((bt["capital"] - CAPITAL_TOTAL) / CAPITAL_TOTAL * 100, 2),
+                "max_drawdown":          round(bt["max_drawdown"], 4),
+                "wins":                  bt["wins"],
+                "losses":                bt["losses"],
+                "win_rate":              round(bt["wins"] / total * 100, 1) if total else 0,
+                "skipped":               bt["skipped"],
+                "entry_usd":             ENTRY_USD,
+                "divergence_max":        DIVERGENCE_MAX,
+                "harm_entry_min":        HARM_ENTRY_MIN,
+                "first_signal_gap_min":  FIRST_SIGNAL_GAP_MIN,
+                "first_signal_gap_max":  FIRST_SIGNAL_GAP_MAX,
             },
             "trades": bt["trades"],
         }, f, indent=2)
@@ -861,9 +879,10 @@ def _save_log():
 # ═══════════════════════════════════════════════════════
 
 async def main_loop():
-    log_event("basket.py iniciado — SIMULACION BINARIA v7 (basket 3 activos, filtros optimizados)")
+    log_event("basket.py iniciado — SIMULACION BINARIA v8 (primera señal con rango -9 a -7pts)")
     log_event(f"Capital: ${CAPITAL_TOTAL:.0f} | Entrada: ${ENTRY_USD:.2f}x3 = ${ENTRY_USD*3:.2f} por ciclo")
     log_event(f"div>={DIVERGENCE_THRESHOLD:.0%} ≤{DIVERGENCE_MAX:.1%} | harm≥{HARM_ENTRY_MIN:.2f} | Ventana {ENTRY_OPEN_SECS}s–{ENTRY_WINDOW_SECS}s")
+    log_event(f"Filtro primera señal: gap estrictamente entre {FIRST_SIGNAL_GAP_MIN*100:.0f}pts y {FIRST_SIGNAL_GAP_MAX*100:.0f}pts")
 
     restore_state_from_csv()
 
@@ -952,10 +971,11 @@ def run_dashboard():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v7")
+    log.info("  BASKET — DIVERGENCIA ARMONICA  [BINARIO]  v8")
     log.info(f"  Capital: ${CAPITAL_TOTAL:.0f}  |  Entrada: ${ENTRY_USD:.2f}x3 por ciclo")
     log.info(f"  Gap: {DIVERGENCE_THRESHOLD*100:.0f}pts — {DIVERGENCE_MAX*100:.1f}pts  |  harm≥{HARM_ENTRY_MIN:.2f}")
     log.info(f"  Ventana: {ENTRY_OPEN_SECS}s — {ENTRY_WINDOW_SECS}s")
+    log.info(f"  Filtro primera señal: gap estrictamente entre {FIRST_SIGNAL_GAP_MIN*100:.0f}–{FIRST_SIGNAL_GAP_MAX*100:.0f}pts")
     log.info(f"  Backtest: WR 99.3% | PF 12.39 | 1 loss en 142 trades")
     log.info("  SIMULACION — SIN DINERO REAL")
     log.info("=" * 60)
